@@ -160,12 +160,20 @@ grep -q overlay /proc/filesystems || exit 1
 
 is_flash_root=true
 is_nfs_root=false
+block_overlay=
 # Anchor these to the root= value. A bare "ram"/"mmcblk"/"nfs" matched the whole
 # command line, so any unrelated token carrying those letters -- e.g. the
 # "ramoops" crash-log parameters -- was mistaken for a ramdisk/SD/NFS root, the
 # flash overlay was never mounted, and the camera booted read-only and unclaimed.
 grep -qE 'root=[^ ]*(nfs|mmcblk|ram)' /proc/cmdline && is_flash_root=false
 grep -qE 'root=[^ ]*nfs' /proc/cmdline && is_nfs_root=true
+# overlay=/dev/<partition>: keep the overlay on a block device (an SD card)
+# instead of flash. No other board sets it.
+for parameter in $(cat /proc/cmdline); do
+	case "$parameter" in
+		overlay=/dev/*) block_overlay=${parameter#overlay=} ;;
+	esac
+done
 
 if $is_flash_root; then
 	# A UBI root -- a UBIFS rootfs, or a squashfs through ubiblock -- keeps its
@@ -245,6 +253,28 @@ if $is_flash_root; then
 			: > "/overlay/$OVERLAY_MARK"
 		fi
 	fi
+elif [ -n "$block_overlay" ]; then
+	if ! mount -t ext4 -o noatime "$block_overlay" /overlay; then
+		if blkid "$block_overlay" > /dev/null 2>&1; then
+			# Something is on the partition, so a mount failure is not ours
+			# to fix by formatting: keep it for a kernel that can read it.
+			echo "Cannot mount $block_overlay; leaving it untouched, settings are in RAM."
+			mount -t tmpfs tmpfs /overlay || exit 1
+		elif ! command -v mke2fs > /dev/null; then
+			# mke2fs comes from BR2_PACKAGE_E2FSPROGS, not busybox.
+			echo "No filesystem on $block_overlay and no mke2fs to make one; settings are in RAM."
+			mount -t tmpfs tmpfs /overlay || exit 1
+		else
+			echo "Formatting $block_overlay..."
+			if mke2fs -t ext4 -F -L rootfs_data "$block_overlay" &&
+				mount -t ext4 -o noatime "$block_overlay" /overlay; then
+				:
+			else
+				echo "Cannot format $block_overlay; settings are in RAM."
+				mount -t tmpfs tmpfs /overlay || exit 1
+			fi
+		fi
+	fi
 elif $is_nfs_root && grep -q ' ro ' /proc/cmdline; then
 	TMPFS_SIZE='@TMPFS_SIZE@'
 	TMPFS_SIZE="${TMPFS_SIZE:-16M}"
@@ -254,7 +284,7 @@ elif $is_nfs_root && grep -q ' ro ' /proc/cmdline; then
 	fi
 fi
 
-if $is_flash_root || $is_nfs_root; then
+if $is_flash_root || $is_nfs_root || [ -n "$block_overlay" ]; then
 	if grep -q overlayfs /proc/filesystems; then
 		if ! mount -t overlayfs overlayfs -o lowerdir=/,upperdir=/overlay,ro /mnt; then
 			umount /overlay
